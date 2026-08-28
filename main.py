@@ -16,6 +16,7 @@ Endpoint: POST /fill-approval-form
 
 import io
 import re
+import logging
 from copy import deepcopy
 
 import requests
@@ -29,6 +30,7 @@ from docx.oxml.ns import qn
 
 
 app = FastAPI(title="خدمة تعبئة الاستمارات")
+logger = logging.getLogger(__name__)
 
 
 MONTHS = [
@@ -102,7 +104,7 @@ def format_birth_date(raw: str) -> str:
 # التعامل مع خلايا الجدول
 # ============================================================================
 
-def set_cell_text(cell, lines, template_cell=None):
+def set_cell_text(cell, lines):
     """
     نكتب نص بخلية، مع دعم عدة أسطر داخل نفس الخلية.
 
@@ -190,18 +192,37 @@ def find_data_table(document):
 # ============================================================================
 
 def fill_template(template_bytes: bytes, passengers: list[Passenger]) -> bytes:
+    """
+    نعبّي قالب Word بيانات الجوازات.
+    
+    ⚠ تحسينات:
+    - نتحقق إن الجدول فيه عدد كافي من الأعمدة قبل التعبئة
+    - لو الجدول ما فيه صفوف بيانات نهائي، نرجّع exception واضح
+    """
+    
     document = Document(io.BytesIO(template_bytes))
 
     table = find_data_table(document)
     if table is None:
-        raise ValueError("ما لقينا جدول البيانات بالقالب")
+        raise ValueError("ما لقينا جدول البيانات بالقالب — تأكد من القالب")
 
     # الصف الأول عناوين، والباقي صفوف فاضية جاهزة بالقالب
+    if not table.rows:
+        raise ValueError("الجدول فاضي تماماً — بدون حتى عناوين")
+    
     header_row = table.rows[0]
     body_rows = list(table.rows[1:])
 
     if not body_rows:
-        raise ValueError("الجدول بالقالب ما بيه صفوف بيانات")
+        raise ValueError(
+            "الجدول بالقالب ما بيه صفوف بيانات — قالب خاطئ"
+        )
+
+    # تحقق من عدد الأعمدة
+    if len(header_row.cells) < 8:
+        raise ValueError(
+            f"الجدول بالقالب فيه {len(header_row.cells)} أعمدة بس، والمطلوب 8"
+        )
 
     # نستخدم أول صف فاضي كنموذج للاستنساخ
     template_row = body_rows[0]
@@ -232,6 +253,9 @@ def fill_template(template_bytes: bytes, passengers: list[Passenger]) -> bytes:
 
         cells = data_rows[index].cells
         if len(cells) < 8:
+            logger.warning(
+                f"الصف {index} بالجدول فيه {len(cells)} خانة بس — ما ممكن نعبّي كل البيانات"
+            )
             continue
 
         serial = passenger.serial if passenger.serial > 0 else index + 1
@@ -291,7 +315,13 @@ def fill_approval_form(request: FillRequest):
                 },
             )
         template_bytes = response.content
+    except requests.exceptions.Timeout:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "انتهت المهلة الزمنية لتحميل القالب"},
+        )
     except Exception as error:
+        logger.exception("خطأ في تحميل القالب")
         return JSONResponse(
             status_code=400,
             content={"success": False, "error": f"تعذر تحميل القالب: {error}"},
@@ -300,7 +330,14 @@ def fill_approval_form(request: FillRequest):
     # 2. نعبّيه
     try:
         filled = fill_template(template_bytes, request.passengers)
+    except ValueError as error:
+        # خطأ التحقق — مشكلة في القالب نفسه
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": f"خطأ بالقالب: {error}"},
+        )
     except Exception as error:
+        logger.exception("خطأ غير متوقع في التعبئة")
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": f"فشلت التعبئة: {error}"},
